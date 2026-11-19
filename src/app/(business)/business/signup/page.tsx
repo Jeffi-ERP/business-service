@@ -1,0 +1,924 @@
+'use client'
+
+import { Suspense, useState, useEffect, useRef } from 'react'
+import Link from 'next/link'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { useStoreConfig } from '@/contexts/StoreConfigContext'
+import { openGoogleOAuthPopup, consumeGoogleRedirect, type GoogleOAuthResult } from '@/lib/client/google-oauth-popup'
+import SocialSignInButtons from '@/components/auth/SocialSignInButtons'
+import OAuthEmailField from '@/components/auth/OAuthEmailField'
+import { isSocialProvider, oauthErrorMessage } from '@/lib/auth/social/types'
+import AdminSelect from '@/components/admin/AdminSelect'
+import { bp } from '@/lib/shared/business-path'
+import DatePicker from '@/components/ui/DatePicker'
+import AuthSplitShell, { AUTH_POINTS, AUTH_THEMES } from '@/components/auth/AuthSplitShell'
+import { useLeaveTo } from '@/components/auth/useLeaveTo'
+import PhoneVerifyModal from '@/components/visitor/PhoneVerifyModal'
+import { isValidDob } from '@/lib/shared/format'
+import { BusinessAuthSkeleton } from '@/components/visitor/skeletons/auth'
+
+export default function BusinessSignUpWrapper() {
+  return (
+    <Suspense fallback={<BusinessAuthSkeleton kind="signup" />}>
+      <BusinessSignUpPage />
+    </Suspense>
+  )
+}
+
+function BusinessSignUpPage() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const config = useStoreConfig()
+  const { leaving, go } = useLeaveTo()
+  // Which button started the sign-in, so that one keeps its spinner until the next page opens.
+  const via = useRef<'google' | 'form' | null>(null)
+
+  const [step, setStep] = useState<'email' | 'otp' | 'details'>('email')
+  const [email, setEmail] = useState(searchParams.get('email') || '')
+  const [otp, setOtp] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const [googleLoading, setGoogleLoading] = useState(false)
+  const [resendCooldown, setResendCooldown] = useState(0)
+  const [error, setError] = useState(oauthErrorMessage(searchParams.get('oauth_error')))
+  const [policyAccepted, setPolicyAccepted] = useState(false)
+  const otpInputRef = useRef<HTMLInputElement>(null)
+  const submittedOtpRef = useRef<string>('')
+
+  const isGoogleParam = searchParams.get('google') === '1'
+  const [isGoogleFlow, setIsGoogleFlow] = useState(isGoogleParam)
+  const [googleAccessToken, setGoogleAccessToken] = useState('')
+  const googleHydratedRef = useRef(false)
+  const [showPhoneVerify, setShowPhoneVerify] = useState(false)
+
+  // Business details
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [dob, setDob] = useState('')
+  const [companyName, setCompanyName] = useState('')
+  const [gstNumber, setGstNumber] = useState('')
+  const [industry, setIndustry] = useState('')
+
+  // Back from a provider sign-in with no business account yet (?oauth=<provider>): the details step
+  // finishes the sign-up. needsEmail = the provider shared no verified address.
+  const oauthParam = searchParams.get('oauth')
+  const [oauthPending, setOauthPending] = useState<{ needsEmail: boolean } | null>(null)
+  const [oauthEmailVerified, setOauthEmailVerified] = useState(false)
+  const oauthHydratedRef = useRef(false)
+
+  useEffect(() => {
+    if (!isSocialProvider(oauthParam) || oauthHydratedRef.current) return
+    oauthHydratedRef.current = true
+    fetch('/api/auth/oauth/pending', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => {
+        const pending = d?.pending
+        if (!pending || pending.portal !== 'business') {
+          setError('Your sign-up session expired. Please try again.')
+          return
+        }
+        setEmail(pending.profile?.email || '')
+        setFirstName(pending.profile?.firstName || '')
+        setLastName(pending.profile?.lastName || '')
+        setOauthPending({ needsEmail: !!pending.needsEmail })
+        setIsGoogleFlow(true)
+        setStep('details')
+      })
+      .catch(() => setError('Your sign-up session expired. Please try again.'))
+  }, [oauthParam])
+
+  // Not removed here: Strict Mode runs this effect twice in dev. Cleared once the account is created.
+  useEffect(() => {
+    if (!isGoogleParam || googleHydratedRef.current) return
+    googleHydratedRef.current = true
+    try {
+      const raw = sessionStorage.getItem('business_google_signup')
+      if (!raw) {
+        setError('Google sign-up session expired. Please try again.')
+        setIsGoogleFlow(false)
+        return
+      }
+      const { accessToken, profile } = JSON.parse(raw)
+      setGoogleAccessToken(accessToken)
+      setEmail(profile.email || '')
+      setFirstName(profile.firstName || '')
+      setLastName(profile.lastName || '')
+      setIsGoogleFlow(true)
+      setStep('details')
+    } catch {
+      setError('Google sign-up session expired. Please try again.')
+      setIsGoogleFlow(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Structured address
+  const [addressLine1, setAddressLine1] = useState('')
+  const [pinCode, setPinCode] = useState('')
+  const [pinLookupState, setPinLookupState] = useState<'idle' | 'loading' | 'found' | 'error'>('idle')
+  const [localities, setLocalities] = useState<string[]>([])
+  const [locality, setLocality] = useState('')
+  const [landmark, setLandmark] = useState('')
+  const [city, setCity] = useState('')
+  const [addrState, setAddrState] = useState('')
+  const pinDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return
+    const t = setTimeout(() => setResendCooldown(c => c - 1), 1000)
+    return () => clearTimeout(t)
+  }, [resendCooldown])
+
+  const handlePinChange = (val: string) => {
+    const digits = val.replace(/\D/g, '').slice(0, 6)
+    setPinCode(digits)
+    if (digits.length < 6) {
+      setPinLookupState('idle')
+      setLocalities([])
+      setLocality('')
+      setCity('')
+      setAddrState('')
+      return
+    }
+    if (pinDebounceRef.current) clearTimeout(pinDebounceRef.current)
+    pinDebounceRef.current = setTimeout(async () => {
+      setPinLookupState('loading')
+      try {
+        const res = await fetch(`/api/pincode/${digits}`)
+        if (!res.ok) throw new Error()
+        const data = await res.json()
+        setCity(data.district || '')
+        setAddrState(data.state || '')
+        const offices: string[] = (data.postOffices || []).filter(Boolean)
+        setLocalities(offices)
+        setLocality(offices[0] || '')
+        setPinLookupState('found')
+      } catch {
+        setPinLookupState('error')
+        setCity('')
+        setAddrState('')
+        setLocalities([])
+        setLocality('')
+      }
+    }, 400)
+  }
+
+  const buildBusinessAddress = () =>
+    [addressLine1, locality, landmark, city, addrState, pinCode]
+      .map(s => s.trim())
+      .filter(Boolean)
+      .join(', ')
+
+  const handleSendOTP = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    via.current = 'form'
+    setIsLoading(true)
+    try {
+      const res = await fetch('/api/auth/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, isSignup: true, userType: 'business' }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        if (res.status === 429 && typeof data.retryAfter === 'number') {
+          setResendCooldown(data.retryAfter)
+          setStep('otp')
+          throw new Error(data.error || 'Please wait before requesting another OTP')
+        }
+        if (data.userExists) {
+          router.push(`${bp('/business/signin')}?email=${encodeURIComponent(email)}`)
+          return
+        }
+        throw new Error(data.error || 'Failed to send OTP')
+      }
+      setStep('otp')
+      setResendCooldown(typeof data.nextCooldown === 'number' ? data.nextCooldown : 30)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleVerifyOTP = async (otpValue: string) => {
+    if (submittedOtpRef.current === otpValue) return
+    if (!policyAccepted) return
+    submittedOtpRef.current = otpValue
+    setError('')
+    via.current = 'form'
+    setIsLoading(true)
+    try {
+      const res = await fetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, otp: otpValue }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Invalid OTP')
+      setStep('details')
+    } catch (err: any) {
+      setError(err.message)
+      setOtp('')
+      submittedOtpRef.current = ''
+      setTimeout(() => otpInputRef.current?.focus(), 0)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleOTPSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (otp.length === 6) await handleVerifyOTP(otp)
+  }
+
+  useEffect(() => {
+    if (step !== 'otp' || otp.length !== 6 || isLoading) return
+    if (!policyAccepted) return
+    handleVerifyOTP(otp)
+  }, [otp, step, isLoading, policyAccepted])
+
+  const handleResendOTP = async () => {
+    setError('')
+    setOtp('')
+    submittedOtpRef.current = ''
+    via.current = 'form'
+    setIsLoading(true)
+    try {
+      const res = await fetch('/api/auth/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, isSignup: true, userType: 'business' }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        if (res.status === 429 && typeof data.retryAfter === 'number') setResendCooldown(data.retryAfter)
+        throw new Error(data.error || 'Failed to resend OTP')
+      }
+      setResendCooldown(typeof data.nextCooldown === 'number' ? data.nextCooldown : 60)
+      setTimeout(() => otpInputRef.current?.focus(), 0)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Back from Google in this tab: finish sign-up with the returned token.
+  useEffect(() => {
+    const r = consumeGoogleRedirect()
+    if (r) handleGoogleSignUp(r)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleGoogleSignUp = async (returned?: GoogleOAuthResult) => {
+    setError('')
+    const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID
+    if (!clientId) {
+      setError('Google sign-in is not configured')
+      return
+    }
+    via.current = 'google'
+    setGoogleLoading(true)
+    const result = returned ?? (await openGoogleOAuthPopup({ clientId, returnTo: bp('/business/signup') }))
+    if (!result.accessToken) {
+      if (result.error && result.error !== 'popup_closed') setError(result.error)
+      setGoogleLoading(false)
+      return
+    }
+    try {
+      const res = await fetch('/api/business/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ accessToken: result.accessToken }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Google sign-in failed')
+      if (data.newUser) {
+        try {
+          sessionStorage.setItem(
+            'business_google_signup',
+            JSON.stringify({ accessToken: result.accessToken, profile: data.profile })
+          )
+        } catch {}
+        setGoogleAccessToken(result.accessToken)
+        setEmail(data.profile.email || '')
+        setFirstName(data.profile.firstName || '')
+        setLastName(data.profile.lastName || '')
+        setIsGoogleFlow(true)
+        setStep('details')
+        return
+      }
+      if (data.approvalStatus === 'pending') {
+        go(bp('/business/pending'))
+        return
+      }
+      go(bp('/business'), 'hard')
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setGoogleLoading(false)
+    }
+  }
+
+  const handleDetailsSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    if (pinCode.length !== 6) {
+      setError('Enter a valid 6-digit PIN code')
+      return
+    }
+    if (!city.trim() || !addrState.trim()) {
+      setError('PIN code lookup failed — enter city and state manually')
+      return
+    }
+    if (!companyName.trim()) {
+      setError('Company name is required')
+      return
+    }
+    if (!gstNumber.trim()) {
+      setError('GST number is required')
+      return
+    }
+    if (!industry.trim()) {
+      setError('Please select an industry')
+      return
+    }
+    if (!firstName.trim()) {
+      setError('First name is required')
+      return
+    }
+    if (phone.length !== 10) {
+      setError('Enter a valid 10-digit mobile number')
+      return
+    }
+    if (!isValidDob(dob)) {
+      setError('Enter a valid date of birth')
+      return
+    }
+    if (oauthPending?.needsEmail && !oauthEmailVerified) {
+      setError('Verify your email address to continue')
+      return
+    }
+    const businessAddress = buildBusinessAddress()
+    via.current = 'form'
+    setIsLoading(true)
+    try {
+      if (isGoogleFlow) {
+        const res = await fetch(oauthPending ? '/api/auth/oauth/complete' : '/api/business/google/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            ...(oauthPending ? (oauthPending.needsEmail ? { email: email.trim() } : {}) : { accessToken: googleAccessToken }),
+            firstName,
+            lastName,
+            phone: `+91${phone}`,
+            dateOfBirth: dob,
+            companyName,
+            gstNumber,
+            businessAddress,
+            industry,
+          }),
+        })
+        const data = await res.json()
+        if (!res.ok) {
+          if (res.status === 409) {
+            router.push(`${bp('/business/signin')}?email=${encodeURIComponent(email)}&notice=already_registered`)
+            return
+          }
+          throw new Error(data.error || 'Signup failed')
+        }
+        try {
+          sessionStorage.removeItem('business_google_signup')
+        } catch {}
+        setShowPhoneVerify(true)
+        return
+      }
+
+      const res = await fetch('/api/business/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          email,
+          otp,
+          firstName,
+          lastName,
+          phone,
+          dateOfBirth: dob,
+          companyName,
+          gstNumber,
+          businessAddress,
+          industry,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        if (res.status === 400 && data.error?.includes('already exists')) {
+          router.push(`${bp('/business/signin')}?email=${encodeURIComponent(email)}&notice=already_registered`)
+          return
+        }
+        throw new Error(data.error || 'Signup failed')
+      }
+      go(bp('/business/pending'))
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const industries = [
+    'Manufacturing',
+    'Construction',
+    'Solar & Renewable Energy',
+    'Electronics & Electrical',
+    'Retail & Distribution',
+    'Engineering & Fabrication',
+    'Agriculture',
+    'Education',
+    'Government',
+    'Healthcare',
+    'IT & Technology',
+    'Other',
+  ]
+
+  const inputCls =
+    'w-full px-3 py-2.5 border border-border-secondary rounded-lg bg-surface text-foreground text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500'
+
+  const googleBusy = googleLoading || (leaving && via.current === 'google')
+  const formBusy = isLoading || (leaving && via.current === 'form')
+
+  return (
+    <>
+      <AuthSplitShell
+        brandName={config.identity.name}
+        logoUrl={config.identity.logoUrl}
+        headline="Become a business partner"
+        sub="Apply once for trade pricing, bulk quotes and GST invoicing in your company's name."
+        points={AUTH_POINTS.business}
+        footnote="Applications are reviewed within 24–48 hours."
+        theme={AUTH_THEMES.business}
+        corner={
+          <>
+          <span className="hidden sm:inline-flex items-center text-sm text-foreground-secondary bg-surface/90 backdrop-blur px-3 py-2 rounded-lg border border-border-default">
+            Already have an account?
+          </span>
+          <Link
+            href={bp('/business/signin')}
+            className="ui-btn inline-flex items-center px-4 py-2 rounded-lg bg-accent-500 hover:bg-accent-600 text-white text-sm font-semibold transition-colors shadow-sm"
+          >
+            Sign in
+          </Link>
+          </>
+        }
+      >
+            <div className="mb-8">
+              <Link
+                href="/"
+                className="text-sm text-foreground-muted hover:text-foreground mb-6 flex items-center gap-1"
+              >
+                ← Back to store
+              </Link>
+              <h1 className="ui-heading text-3xl font-bold text-foreground">
+                {step === 'details' ? 'Business Details' : 'Business Sign Up'}
+              </h1>
+              <p className="text-sm text-foreground-secondary mt-2">
+                {step === 'details'
+                  ? 'Tell us about your business — our team will review your application.'
+                  : 'Create a business partner account to access exclusive pricing.'}
+              </p>
+            </div>
+
+            {error && (
+              <div className="mb-5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 px-4 py-3 rounded-lg text-sm">
+                {error}
+              </div>
+            )}
+
+            {/* Step: Email */}
+            {step === 'email' && (
+              <>
+                <SocialSignInButtons
+                  portal="business"
+                  busyLabel="Please wait…"
+                  onGooglePlatform={() => handleGoogleSignUp()}
+                  googleBusy={googleBusy}
+                  className="mb-5"
+                >
+                  <div className="relative mb-5">
+                    <div className="absolute inset-0 flex items-center">
+                      <div className="w-full border-t border-border-default" />
+                    </div>
+                    <div className="relative flex justify-center text-xs">
+                      <span className="px-3 bg-surface text-foreground-muted">or continue with email</span>
+                    </div>
+                  </div>
+                </SocialSignInButtons>
+                <form onSubmit={handleSendOTP} className="space-y-5">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground-secondary mb-1.5">Business Email</label>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={e => setEmail(e.target.value)}
+                      className="ui-input w-full px-4 py-3 border border-border-secondary rounded-lg bg-surface text-foreground placeholder:text-foreground-muted focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                      placeholder="you@company.com"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={formBusy}
+                    className="ui-btn w-full bg-accent-500 hover:bg-accent-600 text-white px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center"
+                  >
+                    {formBusy ? (
+                      <>
+                        <div className="animate-spin w-5 h-5 border-2 border-white border-t-transparent rounded-full mr-2" />
+                        Sending…
+                      </>
+                    ) : (
+                      'Send Verification Code'
+                    )}
+                  </button>
+                </form>
+                <p className="mt-6 text-sm text-center text-foreground-secondary">
+                  Already have an account?{' '}
+                  <Link
+                    href={bp('/business/signin')}
+                    className="text-accent-600 dark:text-accent-400 hover:text-accent-700 font-medium"
+                  >
+                    Sign in
+                  </Link>
+                </p>
+              </>
+            )}
+
+            {/* Step: OTP */}
+            {step === 'otp' && (
+              <form onSubmit={handleOTPSubmit} className="space-y-5">
+                <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
+                  <p className="text-sm text-blue-800 dark:text-blue-300">
+                    We&apos;ve sent a 6-digit code to <strong>{email}</strong>
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-foreground-secondary mb-1.5">
+                    Verification Code
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    value={otp}
+                    ref={otpInputRef}
+                    onChange={e => setOtp(e.target.value.replace(/\D/g, ''))}
+                    className={`ui-input w-full px-4 py-3 border rounded-lg bg-surface text-foreground focus:ring-2 focus:ring-accent-500 focus:border-accent-500 text-center text-2xl tracking-widest ${
+                      otp.length === 6
+                        ? 'border-green-500 ring-2 ring-green-200 dark:ring-green-900/40'
+                        : 'border-border-secondary'
+                    }`}
+                    placeholder="000000"
+                    autoFocus
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                  />
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <button
+                    type="button"
+                    onClick={handleResendOTP}
+                    disabled={formBusy || resendCooldown > 0}
+                    className="text-accent-600 dark:text-accent-400 font-medium disabled:opacity-50"
+                  >
+                    {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : 'Resend Code'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStep('email')
+                      setOtp('')
+                      submittedOtpRef.current = ''
+                    }}
+                    className="text-foreground-secondary hover:text-foreground"
+                  >
+                    Change Email
+                  </button>
+                </div>
+                <label className="flex items-start gap-2 text-sm text-foreground-secondary cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={policyAccepted}
+                    onChange={e => setPolicyAccepted(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 accent-accent-500 cursor-pointer"
+                  />
+                  <span>
+                    I agree to the{' '}
+                    <a
+                      href="/legal/privacy-policy"
+                      target="_blank"
+                      rel="noopener"
+                      className="text-accent-500 hover:underline font-medium"
+                    >
+                      Privacy Policy
+                    </a>{' '}
+                    and{' '}
+                    <a
+                      href="/legal/terms-and-conditions"
+                      target="_blank"
+                      rel="noopener"
+                      className="text-accent-500 hover:underline font-medium"
+                    >
+                      Terms &amp; Conditions
+                    </a>
+                    .
+                  </span>
+                </label>
+                <button
+                  type="submit"
+                  disabled={otp.length !== 6 || formBusy || !policyAccepted}
+                  className="ui-btn w-full bg-accent-500 hover:bg-accent-600 text-white px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-60 flex items-center justify-center"
+                >
+                  {formBusy ? (
+                    <>
+                      <div className="animate-spin w-5 h-5 border-2 border-white border-t-transparent rounded-full mr-2" />
+                      Verifying…
+                    </>
+                  ) : (
+                    'Verify Email'
+                  )}
+                </button>
+              </form>
+            )}
+
+            {/* Step: Business Details */}
+            {step === 'details' && (
+              <form onSubmit={handleDetailsSubmit} className="space-y-4">
+                {isGoogleFlow && oauthPending?.needsEmail && (
+                  <OAuthEmailField
+                    email={email}
+                    onEmail={setEmail}
+                    verified={oauthEmailVerified}
+                    onVerified={setOauthEmailVerified}
+                    userType="business"
+                  />
+                )}
+                {isGoogleFlow && !oauthPending?.needsEmail && (
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">Email</label>
+                    <input
+                      type="email"
+                      value={email}
+                      readOnly
+                      disabled
+                      className={`${inputCls} bg-surface-secondary text-foreground-muted cursor-not-allowed`}
+                    />
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">First Name *</label>
+                    <input
+                      type="text"
+                      required
+                      value={firstName}
+                      onChange={e => setFirstName(e.target.value)}
+                      className={inputCls}
+                      placeholder="First"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">Last Name</label>
+                    <input
+                      type="text"
+                      value={lastName}
+                      onChange={e => setLastName(e.target.value)}
+                      className={inputCls}
+                      placeholder="Last"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">Mobile Number *</label>
+                  <div className="flex">
+                    <span className="ui-addon inline-flex items-center px-3 py-2.5 border border-r-0 border-border-secondary rounded-l-lg bg-surface-secondary text-foreground-secondary text-sm">
+                      +91
+                    </span>
+                    <input
+                      type="tel"
+                      inputMode="numeric"
+                      maxLength={10}
+                      value={phone}
+                      onChange={e => setPhone(e.target.value.replace(/\D/g, ''))}
+                      className="ui-input w-full px-3 py-2.5 border border-border-secondary rounded-r-lg bg-surface text-foreground text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                      placeholder="00000 00000"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">Date of Birth *</label>
+                  <DatePicker
+                    value={dob}
+                    onChange={setDob}
+                    max={new Date().toISOString().slice(0, 10)}
+                    placeholder="dd/mm/yyyy"
+                    className="w-full"
+                  />
+                  {dob.length > 0 && !isValidDob(dob) && (
+                    <p className="mt-1 text-xs text-red-500">Enter a valid date of birth</p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">Company Name *</label>
+                  <input
+                    type="text"
+                    required
+                    value={companyName}
+                    onChange={e => setCompanyName(e.target.value)}
+                    className={inputCls}
+                    placeholder="Your Company Pvt. Ltd."
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">GST Number *</label>
+                  <input
+                    type="text"
+                    required
+                    value={gstNumber}
+                    onChange={e => setGstNumber(e.target.value.toUpperCase())}
+                    maxLength={15}
+                    className={`${inputCls} font-mono tracking-wider`}
+                    placeholder="22AAAAA0000A1Z5"
+                  />
+                </div>
+
+                {/* Structured address */}
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">PIN Code *</label>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={pinCode}
+                      onChange={e => handlePinChange(e.target.value)}
+                      className={`${inputCls} pr-8`}
+                      placeholder="6-digit PIN"
+                    />
+                    {pinLookupState === 'loading' && (
+                      <div className="absolute right-2.5 top-1/2 -translate-y-1/2">
+                        <div className="w-4 h-4 border-2 border-accent-500 border-t-transparent rounded-full animate-spin" />
+                      </div>
+                    )}
+                    {pinLookupState === 'found' && (
+                      <div className="absolute right-2.5 top-1/2 -translate-y-1/2 text-green-500">
+                        <svg
+                          className="w-4 h-4"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          strokeWidth={2.5}
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                        </svg>
+                      </div>
+                    )}
+                    {pinLookupState === 'error' && (
+                      <div className="absolute right-2.5 top-1/2 -translate-y-1/2 text-red-400">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </div>
+                    )}
+                  </div>
+                  {pinLookupState === 'error' && (
+                    <p className="mt-1 text-xs text-red-500">
+                      PIN code not found — enter city and state below manually.
+                    </p>
+                  )}
+                </div>
+
+                {(pinLookupState === 'found' || pinLookupState === 'error') && (
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">Locality / Area</label>
+                    {localities.length > 0 ? (
+                      <AdminSelect
+                        value={locality}
+                        onChange={setLocality}
+                        placeholder="Select locality…"
+                        options={localities.map(l => ({ value: l, label: l }))}
+                        sm
+                      />
+                    ) : (
+                      <input
+                        type="text"
+                        value={locality}
+                        onChange={e => setLocality(e.target.value)}
+                        className={inputCls}
+                        placeholder="Locality / area name"
+                      />
+                    )}
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-medium text-foreground-secondary mb-1">
+                    Landmark <span className="text-foreground-muted">(optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={landmark}
+                    onChange={e => setLandmark(e.target.value)}
+                    className={inputCls}
+                    placeholder="Near post office, opposite temple…"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">City *</label>
+                    <input
+                      type="text"
+                      required
+                      value={city}
+                      onChange={e => setCity(e.target.value)}
+                      readOnly={pinLookupState === 'found'}
+                      className={`${inputCls} ${pinLookupState === 'found' ? 'bg-surface-secondary text-foreground-secondary' : ''}`}
+                      placeholder="City"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-foreground-secondary mb-1">State *</label>
+                    <input
+                      type="text"
+                      required
+                      value={addrState}
+                      onChange={e => setAddrState(e.target.value)}
+                      readOnly={pinLookupState === 'found'}
+                      className={`${inputCls} ${pinLookupState === 'found' ? 'bg-surface-secondary text-foreground-secondary' : ''}`}
+                      placeholder="State"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <AdminSelect
+                    label="Industry *"
+                    required
+                    value={industry}
+                    onChange={setIndustry}
+                    placeholder="Select industry…"
+                    options={industries.map(i => ({ value: i, label: i }))}
+                    sm
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={formBusy}
+                  className="ui-btn w-full bg-accent-500 hover:bg-accent-600 text-white px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-60 flex items-center justify-center mt-2"
+                >
+                  {formBusy ? (
+                    <>
+                      <div className="animate-spin w-5 h-5 border-2 border-white border-t-transparent rounded-full mr-2" />
+                      Submitting…
+                    </>
+                  ) : (
+                    'Submit Application'
+                  )}
+                </button>
+
+                <p className="text-xs text-foreground-muted text-center">
+                  Your application will be reviewed by our team within 24–48 hours.
+                </p>
+              </form>
+            )}
+      </AuthSplitShell>
+
+      {showPhoneVerify && (
+        <PhoneVerifyModal
+          initialPhone={phone}
+          abandonOnCancel
+          title="Verify your mobile number"
+          onVerified={() => {
+            setShowPhoneVerify(false)
+            go(bp('/business/pending'))
+          }}
+          onCancel={() => {
+            setShowPhoneVerify(false)
+            router.push(bp('/business/signin'))
+          }}
+        />
+      )}
+    </>
+  )
+}

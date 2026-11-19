@@ -1,0 +1,5 @@
+import { SupportSkeleton } from '@/components/visitor/skeletons/marketing'
+
+export default function Loading() {
+  return <SupportSkeleton portal="business" />
+}
